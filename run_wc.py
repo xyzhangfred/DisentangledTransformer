@@ -33,7 +33,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
-from pytorch_pretrained_bert.modeling import BertForMultipleChoice, BertConfig
+from pytorch_pretrained_bert.modeling import BertForSequenceClassification
 from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -74,19 +74,16 @@ class WCExample(object):
 class InputFeatures(object):
     def __init__(self,
                  example_id,
-                 sent_features,
+                 input_ids,
+                 input_mask,
+                 segment_ids,
                  label
 
     ):
         self.example_id = example_id
-        self.sent_features = [
-            {
-                'input_ids': input_ids,
-                'input_mask': input_mask,
-                'segment_ids': segment_ids
-            }
-            for _, input_ids, input_mask, segment_ids in sent_features
-        ]
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
         self.label = label
 
 
@@ -127,7 +124,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
     for example_index, example in enumerate(examples):
         sent_tokens = tokenizer.tokenize(example.sentence)
 
-        sent_features = []
+        #sent_features = []
         # We create a copy of the context tokens in order to be
         # able to shrink it according to ending_tokens
         #sent_tokens_all = sent_tokens[:]
@@ -149,7 +146,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
 
-        sent_features.append((tokens, input_ids, input_mask, segment_ids))
+        #sent_features.append((tokens, input_ids, input_mask, segment_ids))
 
         label = example.label
 #        if example_index < 2:
@@ -167,7 +164,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
         features.append(
             InputFeatures(
                 example_id = example.wc_id,
-                sent_features = sent_features,
+                input_ids = input_ids,
+                input_mask = input_mask,
+                segment_ids = segment_ids,
                 label = label
             )
         )
@@ -194,14 +193,6 @@ def accuracy(out, labels):
     outputs = np.argmax(out, axis=1)
     return np.sum(outputs == labels)
 
-def select_field(features, field):
-    return [
-        [
-            choice[field]
-            for choice in feature.sent_features
-        ]
-        for feature in features
-    ]
 
 def main():
     parser = argparse.ArgumentParser()
@@ -283,7 +274,9 @@ def main():
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
 
-    args = parser.parse_args(['--data_dir','/home/xiongyi/Codes/SentEval/data/probing/word_content.txt,','--bert_model','bert-base-uncased','--output_dir','./tmp','--do_train'])
+    args = parser.parse_args(['--data_dir','/home/xiongyi/Codes/SentEval/data/probing/word_content.txt',\
+                              '--bert_model','bert-base-uncased','--output_dir','./tmp','--do_train',\
+                              '--local_rank', '1', '--train_batch_size', 64])
 
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -293,9 +286,9 @@ def main():
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl')
-    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, bool(args.local_rank != -1), args.fp16))
+#        torch.distributed.init_process_group(backend='nccl')
+#    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
+#        device, n_gpu, bool(args.local_rank != -1), args.fp16))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -320,43 +313,40 @@ def main():
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
     # Prepare model
-    model = BertForMultipleChoice.from_pretrained(args.bert_model,
-        cache_dir=os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank)),
-        num_choices=4)
+    model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels = 1000)
     if args.fp16:
         model.half()
     model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
-
-        model = DDP(model)
-    elif n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+#    if args.local_rank != -1:
+#        try:
+#            from apex.parallel import DistributedDataParallel as DDP
+#        except ImportError:
+#            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+#
+#        model = DDP(model)
+#    elif n_gpu > 1:
+#        model = torch.nn.DataParallel(model)
 
     if args.do_train:
 
         # Prepare data loader
-
-        train_examples = read_WC_examples(os.path.join(args.data_dir, 'train.csv'), is_training = True)
+        train_examples = read_WC_examples(args.data_dir)
         train_features = convert_examples_to_features(
-            train_examples, tokenizer, args.max_seq_length, True)
-        all_input_ids = torch.tensor(select_field(train_features, 'input_ids'), dtype=torch.long)
-        all_input_mask = torch.tensor(select_field(train_features, 'input_mask'), dtype=torch.long)
-        all_segment_ids = torch.tensor(select_field(train_features, 'segment_ids'), dtype=torch.long)
+            train_examples, tokenizer, args.max_seq_length)
+        all_input_ids =  torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
         all_label = torch.tensor([f.label for f in train_features], dtype=torch.long)
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label)
-        if args.local_rank == -1:
+        if 1:
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
 
         num_train_optimization_steps = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
-        if args.local_rank != -1:
-            num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
+#        if args.local_rank != -1:
+#            num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
         # Prepare optimizer
 
@@ -408,7 +398,9 @@ def main():
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids = batch
+                print (input_ids.shape , input_mask.shape, segment_ids.shape, label_ids.shape)
                 loss = model(input_ids, segment_ids, input_mask, label_ids)
+                print ('loss', loss)
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
                 if args.fp16 and args.loss_scale != 1.0:
@@ -435,6 +427,9 @@ def main():
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
+            ###test on all probing/downstream tasks
+            
+                   
 
 
     if args.do_train:
@@ -450,10 +445,10 @@ def main():
         tokenizer.save_vocabulary(args.output_dir)
 
         # Load a trained model and vocabulary that you have fine-tuned
-        model = BertForMultipleChoice.from_pretrained(args.output_dir, num_choices=4)
+        model = BertForSequenceClassification.from_pretrained(args.output_dir, num_labels = 1000)
         tokenizer = BertTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
     else:
-        model = BertForMultipleChoice.from_pretrained(args.bert_model, num_choices=4)
+        model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels = 1000)
     model.to(device)
 
 
@@ -464,9 +459,9 @@ def main():
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
-        all_input_ids = torch.tensor(select_field(eval_features, 'input_ids'), dtype=torch.long)
-        all_input_mask = torch.tensor(select_field(eval_features, 'input_mask'), dtype=torch.long)
-        all_segment_ids = torch.tensor(select_field(eval_features, 'segment_ids'), dtype=torch.long)
+        all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
         all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)
         eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label)
         # Run prediction for full data
