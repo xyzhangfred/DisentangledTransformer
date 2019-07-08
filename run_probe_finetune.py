@@ -1,6 +1,7 @@
-# coding=utf-8
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,15 +14,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BERT finetuning on WC probing."""
+"""BERT finetuning on probing."""
 
 from __future__ import absolute_import
 
 import argparse
 import logging
-import os
+import os,sys
 import random
-import sys
 from io import open
 
 import numpy as np
@@ -41,7 +41,7 @@ from probing_util import InputExample, InputFeaturesNL, convert_examples_to_feat
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)
+                    level = logging.DEBUG, filename = 'probe_finetune_2.log')
 logger = logging.getLogger(__name__)
 
 
@@ -49,8 +49,8 @@ PATH_TO_SENTEVAL = '/home/xiongyi/dataxyz/repos/SentEval/'
 PATH_TO_DATA = '/home/xiongyi/dataxyz/SentEval/data/'
 
 
-class WCExample(object):
-    """A single training/test example for the SWAG dataset."""
+class ProbeExample(object):
+    """A single training/test example for the probing dataset."""
     def __init__(self,
                  wc_id,
                  partition,
@@ -93,7 +93,7 @@ class InputFeatures(object):
         self.label = label
 
 
-def read_WC_examples(input_file):
+def read_Probe_examples(input_file):
     with open(input_file, 'r', encoding='utf-8') as f:
         raw_lines = f.readlines()
         lines = []
@@ -102,6 +102,7 @@ def read_WC_examples(input_file):
             lines.append(line)
     
     examples = []
+    
     label2num = {}
     label_count = 0
     for i,line in enumerate(lines):
@@ -113,15 +114,15 @@ def read_WC_examples(input_file):
             label2num[label_str] = label_count
             label_count += 1
             
-        examples.append(WCExample(
+        examples.append(ProbeExample(
             wc_id = i,
             partition = line[0],
             sentence = line[2],
             label = label_num
         ) 
     )
-
-    return examples
+        
+    return examples,label_count+1
 
 def convert_examples_to_features(examples, tokenizer, max_seq_length):
     """Loads a data file into a list of `InputBatch`s."""
@@ -200,7 +201,7 @@ def accuracy(out, labels):
     return np.sum(outputs == labels)
 
 
-def main():
+def main(finetuning_task = 'word_content'):
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -280,8 +281,11 @@ def main():
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
 
-    args = parser.parse_args(['--data_dir','/home/xiongyi/dataxyz/SentEval/data/probing/word_content.txt',\
-                              '--bert_model','bert-base-uncased','--output_dir','./tmp2','--do_train',\
+    task_name = finetuning_task
+    data_dir = '/home/xiongyi/dataxyz/SentEval/data/probing/'+task_name+'.txt'
+    out_dir = './models/' + finetuning_task
+    args = parser.parse_args(['--data_dir', data_dir,\
+                              '--bert_model','bert-base-uncased','--output_dir',out_dir,'--do_train',\
                               '--local_rank', '-1', '--train_batch_size', '32', '--do_lower_case'])
 
     if args.local_rank == -1 or args.no_cuda:
@@ -320,7 +324,8 @@ def main():
 
     # Prepare model
     #TODO: Num_labels hard coded!
-    model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels = 1000)
+    train_examples, num_labels = read_Probe_examples(args.data_dir)
+    model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels = num_labels)
     if args.fp16:
         model.half()
     model.to(device)
@@ -337,7 +342,6 @@ def main():
     if args.do_train:
 
         # Prepare data loader
-        train_examples = read_WC_examples(args.data_dir)
         train_features = convert_examples_to_features(
             train_examples, tokenizer, args.max_seq_length)
         all_input_ids =  torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
@@ -399,14 +403,14 @@ def main():
         logger.info("  Num steps = %d", num_train_optimization_steps)
 
         
-        for _ in trange(int(args.num_train_epochs), desc="Epoch"):
+        for epoch in trange(int(args.num_train_epochs), desc="Epoch"):
             ###test on all probing/downstream tasks
-            model.eval()
-            results = probe(model,tokenizer, device, args.max_seq_length, batcher, prepare, PATH_TO_SENTEVAL, PATH_TO_DATA,\
-                            ['MR', 'CR', 'MPQA','TREC', 'MRPC','SICKEntailment', 'SICKRelatedness', 'STSBenchmark',
-                      'Length', 'WordContent', 'Depth','BigramShift','OddManOut', 'CoordinationInversion'])
-            print ('results', results)
-            torch.cuda.empty_cache()
+#            model.eval()
+#            results = probe(model,tokenizer, device, args.max_seq_length, batcher, prepare, PATH_TO_SENTEVAL, PATH_TO_DATA,\
+#                            ['MR', 'CR', 'MPQA','TREC', 'MRPC','SICKEntailment', 'SICKRelatedness', 'STSBenchmark',
+#                      'Length', 'WordContent', 'Depth','BigramShift','OddManOut', 'CoordinationInversion'])
+#            print ('results', results)
+#            torch.cuda.empty_cache()
             model.train()
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
@@ -442,84 +446,31 @@ def main():
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
-           
-                   
+            ####save model after each epoch
+            model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+
+            # If we save using the predefined names, we can load using `from_pretrained`
+            output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME+finetuning_task+ '_epoch_'+str(epoch))
+            output_config_file = os.path.join(args.output_dir, CONFIG_NAME+finetuning_task+ '_epoch_'+str(epoch))
+    
+            torch.save(model_to_save.state_dict(), output_model_file)
+            model_to_save.config.to_json_file(output_config_file)              
 
 
     if args.do_train:
-        # Save a trained model, configuration and tokenizer
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-
-        # If we save using the predefined names, we can load using `from_pretrained`
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-
-        torch.save(model_to_save.state_dict(), output_model_file)
-        model_to_save.config.to_json_file(output_config_file)
+#        # Save a trained model, configuration and tokenizer
+#        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+#
+#        # If we save using the predefined names, we can load using `from_pretrained`
+#        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
+#        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+#
+#        torch.save(model_to_save.state_dict(), output_model_file)
+#        model_to_save.config.to_json_file(output_config_file)
         tokenizer.save_vocabulary(args.output_dir)
 
-        # Load a trained model and vocabulary that you have fine-tuned
-        model = BertForSequenceClassification.from_pretrained(args.output_dir, num_labels = 1000)
-        tokenizer = BertTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
-    else:
-        model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels = 1000)
-    model.to(device)
-
-
-    if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
-        eval_examples = read_WC_examples(os.path.join(args.data_dir, 'val.csv'), is_training = True)
-        eval_features = convert_examples_to_features(
-            eval_examples, tokenizer, args.max_seq_length, True)
-        logger.info("***** Running evaluation *****")
-        logger.info("  Num examples = %d", len(eval_examples))
-        logger.info("  Batch size = %d", args.eval_batch_size)
-        all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
-        all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
-        all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
-        all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)
-        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label)
-        # Run prediction for full data
-        eval_sampler = SequentialSampler(eval_data)
-        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
-        model.eval()
-        eval_loss, eval_accuracy = 0, 0
-        nb_eval_steps, nb_eval_examples = 0, 0
-        for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader, desc="Evaluating"):
-            input_ids = input_ids.to(device)
-            input_mask = input_mask.to(device)
-            segment_ids = segment_ids.to(device)
-            label_ids = label_ids.to(device)
-
-            with torch.no_grad():
-                tmp_eval_loss = model(input_ids, segment_ids, input_mask, label_ids)
-                logits = model(input_ids, segment_ids, input_mask)
-
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.to('cpu').numpy()
-            tmp_eval_accuracy = accuracy(logits, label_ids)
-
-            eval_loss += tmp_eval_loss.mean().item()
-            eval_accuracy += tmp_eval_accuracy
-
-            nb_eval_examples += input_ids.size(0)
-            nb_eval_steps += 1
-
-        eval_loss = eval_loss / nb_eval_steps
-        eval_accuracy = eval_accuracy / nb_eval_examples
-
-        result = {'eval_loss': eval_loss,
-                  'eval_accuracy': eval_accuracy,
-                  'global_step': global_step,
-                  'loss': tr_loss/global_step}
-
-        output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results *****")
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
 
 
 if __name__ == "__main__":
-    main()
+    for finetuning_task in ['word_content', 'tree_depth', 'obj_number'] :
+        main(finetuning_task)
